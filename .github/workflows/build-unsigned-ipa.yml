@@ -1,0 +1,103 @@
+name: Build Unsigned IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      scheme:
+        description: "Xcode scheme to build"
+        required: false
+        default: "ESHOTSaatleri"
+      configuration:
+        description: "Build configuration"
+        required: false
+        default: "Release"
+  push:
+    branches: [ main, master ]
+    paths:
+      - ".github/workflows/build-unsigned-ipa.yml"
+      - "ESHOTSaatleri/**"
+      - "*.xcodeproj/**"
+      - "*.xcworkspace/**"
+
+jobs:
+  unsigned-ipa:
+    runs-on: macos-15
+    env:
+      SCHEME: ${{ github.event.inputs.scheme || 'ESHOTSaatleri' }}
+      CONFIGURATION: ${{ github.event.inputs.configuration || 'Release' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select latest stable Xcode
+        run: |
+          XCODE_PATH=$(ls -d /Applications/Xcode*.app | sort | tail -n 1)
+          sudo xcode-select -s "$XCODE_PATH"
+          xcodebuild -version
+
+      - name: Resolve project/workspace
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WORKSPACE=$(find . -maxdepth 2 -name "*.xcworkspace" | head -n 1 || true)
+          PROJECT=$(find . -maxdepth 2 -name "*.xcodeproj" | head -n 1 || true)
+
+          if [[ -n "$WORKSPACE" ]]; then
+            echo "container_flag=-workspace" >> "$GITHUB_OUTPUT"
+            echo "container_path=$WORKSPACE" >> "$GITHUB_OUTPUT"
+          elif [[ -n "$PROJECT" ]]; then
+            echo "container_flag=-project" >> "$GITHUB_OUTPUT"
+            echo "container_path=$PROJECT" >> "$GITHUB_OUTPUT"
+          else
+            echo "No .xcworkspace or .xcodeproj found at repository root." >&2
+            exit 1
+          fi
+
+      - name: Build archive without code signing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          xcodebuild \
+            ${{ steps.resolve.outputs.container_flag }} "${{ steps.resolve.outputs.container_path }}" \
+            -scheme "$SCHEME" \
+            -configuration "$CONFIGURATION" \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            clean archive
+
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP_PATH=$(find "$RUNNER_TEMP/App.xcarchive/Products/Applications" -name "*.app" -maxdepth 1 | head -n 1)
+
+          if [[ -z "$APP_PATH" ]]; then
+            echo "No .app found in archive output" >&2
+            exit 1
+          fi
+
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+
+          IPA_NAME="${SCHEME}-${CONFIGURATION}-unsigned.ipa"
+          ditto -c -k --sequesterRsrc --keepParent Payload "$IPA_NAME"
+
+          mkdir -p output
+          mv "$IPA_NAME" output/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-ipa
+          path: output/*.ipa
+          if-no-files-found: error
